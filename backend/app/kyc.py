@@ -13,7 +13,9 @@ from __future__ import annotations
 import io
 import os
 import random
+import shutil
 import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -206,6 +208,10 @@ class KycCase:
     image: str = ""
     heatmap: str = ""
     history: list = field(default_factory=list)
+    image_path: str = ""
+    document_number: str = ""
+    webhook_url: str = ""
+    webhook_host: str = ""
 
     def to_list(self) -> dict:
         return {
@@ -251,6 +257,39 @@ _lock = threading.Lock()
 _ready = threading.Event()
 
 
+def _allocate_external_id() -> int:
+    """Id numérico que no vuelve a 1 cuando se reinicia el proceso.
+
+    El de unicas es único en users.biometric_session_id. Los casos de prueba
+    del panel usan 1, 2, 3… y al recrear el contenedor se repetían.
+    """
+    path = _case_id_path()
+    with _lock:
+        current = 0
+        try:
+            with open(path, encoding="utf-8") as handle:
+                current = int(handle.read().strip() or "0")
+        except (OSError, ValueError):
+            current = 0
+        if current < 1_000_000_000:
+            current = int(datetime.now(UTC).timestamp())
+        while current in _store:
+            current += 1
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(str(current + 1))
+        return current
+
+
+def _case_id_path() -> str:
+    for directory in (os.getenv("DEEP_GUARD_DATA_DIR", "/app/data"), SEED_DIR):
+        try:
+            os.makedirs(directory, exist_ok=True)
+            return os.path.join(directory, "kyc_next_id")
+        except OSError:
+            continue
+    return os.path.join(SEED_DIR, "kyc_next_id")
+
+
 def _seed() -> None:
     """Builds the store: half the cases are "forged" (double-compressed zone),
     the other half are authentic. Mixed starting statuses."""
@@ -288,7 +327,7 @@ def _seed() -> None:
         path = key["forged" if i % 2 == 1 else "real"]
 
         res = analyze_image(path)
-        verdict = res["verdict_label"]
+        verdict = res["verdict"]
 
         # Mixed and realistic initial statuses: half the forged cases go to
         # "review"/"rejected", half the authentic ones to "pending"/"approved".
@@ -314,6 +353,7 @@ def _seed() -> None:
             reasons=res["reasons"],
             image=res["image"],
             heatmap=res["heatmap"],
+            image_path=path,
         )
         _store[case.id] = case
         _next_id += 1
@@ -381,17 +421,17 @@ def decide(case_id: int, action: str) -> KycCase | None:
 
 def create_case(image_path: str, *, applicant: str = "",
                 doc_type: str = "autre", filename: str = "",
-                reference: str = "") -> KycCase:
+                reference: str = "", document_number: str = "",
+                webhook_url: str = "", webhook_host: str = "") -> KycCase:
     """Submit a new ID document from an API (external client).
 
     Analyzes the image with the real forensic chain, creates a KYC case and
     returns it. The initial status follows the verdict: authentic -> "pending",
     suspect -> "review", forged -> "rejected".
     """
-    global _next_id
     _ready.wait(timeout=10)
     res = analyze_image(image_path)
-    verdict = res["verdict_label"]
+    verdict = res["verdict"]
     if verdict == "forge":
         initial = "rejected"
     elif verdict == "suspect":
@@ -399,10 +439,12 @@ def create_case(image_path: str, *, applicant: str = "",
     else:
         initial = "pending"
 
+    stored_path = os.path.join(SEED_DIR, "cases", f"{uuid.uuid4().hex}{os.path.splitext(filename or image_path)[1] or '.jpg'}")
+    os.makedirs(os.path.dirname(stored_path), exist_ok=True)
+    shutil.copy2(image_path, stored_path)
+
     applicant = (applicant or "").strip() or "External case"
-    with _lock:
-        cid = _next_id
-        _next_id += 1
+    cid = _allocate_external_id()
     case = KycCase(
         id=cid,
         applicant=applicant.upper(),
@@ -419,6 +461,10 @@ def create_case(image_path: str, *, applicant: str = "",
         reasons=res["reasons"],
         image=res["image"],
         heatmap=res["heatmap"],
+        image_path=stored_path,
+        document_number=document_number.strip(),
+        webhook_url=webhook_url.strip(),
+        webhook_host=webhook_host.strip(),
     )
     with _lock:
         _store[case.id] = case
@@ -452,32 +498,28 @@ def update_face_verification(
         defects.append("face_wrong")
     if not liveness_result.get("is_live", False):
         defects.append("liveness_failed")
-    if capture_device == "web":
-        defects.append("capture_not_mobile")
 
-    # Re-run decision engine with face data
     from app.workflow import decide
+    # El análisis forense puntúa anomalías 0..100 (alto = peor). El motor de
+    # decisión espera confianza 0..1 (alto = mejor).
+    forensic_confidence = max(0.0, min(1.0, 1 - (case.score / 100)))
+    face_value = float(face_score or 0)
+    if face_value > 1:
+        face_value = face_value / 100
     result = decide(
-        forensic_score=case.score,
-        face_score=face_score * 100 if face_match else 0,
-        ocr_score=80,  # default — OCR not yet integrated
-        aml_score=0,
-        defects=defects,
+        forensic_score=forensic_confidence,
+        ocr_ok=True,
+        face={"match": face_match, "score": 1.0 if face_match else 0.0},
+        aml={"hit": False, "unresolved": False, "score": 0.0},
+        doc_type=case.doc_type,
+        defects={code: 1 for code in defects},
     )
 
-    # Update case
-    case.score = result["score"]
-    case.verdict = result["verdict"]
-    case.verdict_label = result["verdict_label"]
-    case.reasons = result.get("reasons", case.reasons)
-
-    # Update status based on new verdict
-    if result["verdict"] == "authentique" and result["score"] >= 88:
-        case.status = "approved"
-    elif result["verdict"] == "forge" or result["score"] < 55:
-        case.status = "rejected"
-    else:
-        case.status = "review"
+    case.score = result.score
+    case.verdict = result.verdict
+    case.verdict_label = result.verdict_label
+    case.reasons = list(result.reasons) or case.reasons
+    case.status = result.status
 
     return case
 

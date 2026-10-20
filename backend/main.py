@@ -1,9 +1,8 @@
-from __future__ import annotations
-
 import logging
 import os
 import stat
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 
@@ -50,6 +49,22 @@ app.add_middleware(
 )
 
 init_db()
+
+
+def _warm_face_engine() -> None:
+    """Load DeepFace once so the first selfie does not pay the model startup."""
+    try:
+        from app.services.facematch import is_available
+
+        if is_available():
+            logger.info("Face matching engine ready")
+        else:
+            logger.warning("Face matching engine unavailable")
+    except Exception:
+        logger.exception("Face matching warmup failed")
+
+
+threading.Thread(target=_warm_face_engine, daemon=True, name="face-warmup").start()
 
 
 # Seed a default admin client so the dashboard can authenticate immediately.
@@ -178,6 +193,9 @@ async def create_case(
     applicant: str = Form(""),
     doc_type: str = Form("autre"),
     reference: str = Form(""),
+    document_number: str = Form(""),
+    webhook_url: str = Form(""),
+    webhook_host: str = Form(""),
     client=Depends(current_client),
 ):
     """Submit an ID document for review."""
@@ -202,6 +220,9 @@ async def create_case(
             doc_type=doc_type.strip().lower() or "autre",
             reference=reference.strip(),
             filename=file.filename,
+            document_number=document_number,
+            webhook_url=webhook_url,
+            webhook_host=webhook_host,
         )
     except Exception:
         logger.exception("KYC case creation failed")
@@ -324,25 +345,28 @@ async def mobile_verify(
             "checks": live.get("signals", {}),
         }
         if not liveness_result["is_live"]:
+            _notify_case(case_id, face_match=False, liveness_passed=False)
             raise HTTPException(
                 status_code=403,
                 detail="Liveness check failed. Please try again with a real face.",
             )
 
-        face_result = {"match": False, "score": 0, "distance": 1.0}
+        face_result = {"match": None, "score": None, "distance": None}
         try:
             from app.services.facematch import compare_faces
             case = kyc.get_case(case_id)
-            if case and case.documents and case.documents[0].image_path:
-                try:
-                    match_result = compare_faces(selfie_tmp, case.documents[0].image_path)
-                    face_result = {
-                        "match": match_result.get("match", False),
-                        "score": match_result.get("score", 0),
-                        "distance": match_result.get("distance", 1.0),
-                    }
-                except Exception:
-                    logger.exception("Face matching failed")
+            document_path = getattr(case, "image_path", "") if case else ""
+            if document_path and os.path.exists(document_path):
+                match_result = compare_faces(selfie_tmp, document_path)
+                face_result = {
+                    "match": match_result.get("match"),
+                    "score": match_result.get("score"),
+                    "distance": match_result.get("distance"),
+                }
+                if face_result["match"] is None:
+                    logger.warning("Face matching unavailable: %s", match_result.get("message"))
+            else:
+                logger.warning("Face matching skipped: no document image for case %s", case_id)
         except Exception:
             logger.exception("Face match pipeline error")
 
@@ -362,21 +386,52 @@ async def mobile_verify(
     if not session:
         raise HTTPException(status_code=410, detail="Session expired or already used.")
 
+    document_verdict = ""
+    existing = kyc.get_case(case_id)
+    if existing is not None:
+        document_verdict = existing.verdict
+
     try:
-        kyc.update_face_verification(
-            case_id=case_id,
-            face_match=face_result.get("match", False),
-            face_score=face_result.get("score", 0),
-            liveness_result=liveness_result,
-            capture_device=capture_device,
-        )
+        if face_result.get("match") is not None:
+            kyc.update_face_verification(
+                case_id=case_id,
+                face_match=bool(face_result["match"]),
+                face_score=float(face_result.get("score") or 0),
+                liveness_result=liveness_result,
+                capture_device=capture_device,
+            )
     except Exception:
         logger.exception("Failed to update KYC case with face verification")
 
+    _notify_case(
+        case_id,
+        face_match=face_result.get("match") if isinstance(face_result.get("match"), bool) else None,
+        liveness_passed=bool(liveness_result["is_live"]),
+        document_verdict=document_verdict,
+    )
+
+    return _verify_response(face_result, liveness_result, device)
+
+
+def _notify_case(case_id: int, *, face_match: bool | None, liveness_passed: bool, document_verdict: str | None = None) -> None:
+    case = kyc.get_case(case_id)
+    if case is None:
+        return
+    from app.services.case_webhook import notify_case_completed
+
+    notify_case_completed(
+        case,
+        document_verdict=case.verdict if document_verdict is None else document_verdict,
+        face_match=face_match,
+        liveness_passed=liveness_passed,
+    )
+
+
+def _verify_response(face_result: dict, liveness_result: dict, device) -> dict:
     return {
         "status": "verified",
-        "face_match": face_result.get("match", False),
-        "face_score": face_result.get("score", 0),
+        "face_match": face_result.get("match"),
+        "face_score": face_result.get("score"),
         "liveness_score": liveness_result["score"],
         "device": {
             "is_mobile": device.is_mobile,

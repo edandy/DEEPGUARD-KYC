@@ -5,8 +5,12 @@ sqlalchemy==2.0.36
 httpx==0.28.1
 pillow==11.1.0
 numpy==1.26.4
+# CPU wheels. Newer torch on linux/arm64 pulls several GB of NVIDIA CUDA packages.
+torch==2.2.2
+torchvision==0.17.2
 python-doctr==1.1.0
 deepface==0.0.101
+tf-keras==2.21.0
 opencv-python==4.10.0.84
 rapidfuzz==3.11.0
 reportlab==4.2.5

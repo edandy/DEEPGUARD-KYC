@@ -505,3 +505,43 @@ class TestExport:
         resp = client.get("/api/export/cases?format=csv", headers={"X-API-Key": "dg_demo"})
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "text/csv; charset=utf-8"
+
+
+# ---------------------------------------------------------------------------
+# 12. Face verification
+# ---------------------------------------------------------------------------
+
+class TestFaceVerification:
+    @patch("app.kyc.analyze_image", side_effect=_mock_analyze)
+    def test_mobile_verify_matches_saved_document(self, mock_analyze):
+        created = client.post(
+            "/api/kyc/cases",
+            files={"file": ("doc.png", _tiny_png(), "image/png")},
+            data={"applicant": "Camila", "doc_type": "cni"},
+            headers={"X-API-Key": "dg_demo"},
+        )
+        assert created.status_code == 200, created.text
+        case_id = created.json()["id"]
+
+        session = client.post(
+            f"/api/kyc/cases/{case_id}/face-session",
+            headers={"X-API-Key": "dg_demo"},
+        )
+        assert session.status_code == 200
+        token = session.json()["token"]
+
+        with patch("app.services.liveness.check_liveness", return_value={"score": 0.9, "passed": True, "signals": {}}) as mock_live, \
+             patch("app.services.facematch.compare_faces", return_value={"match": True, "score": 0.91, "distance": 0.2}) as mock_faces:
+            verified = client.post(
+                "/api/mobile/verify",
+                data={"token": token},
+                files={"selfie": ("selfie.jpg", _tiny_png(), "image/jpeg")},
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+            )
+
+        assert verified.status_code == 200, verified.text
+        body = verified.json()
+        assert body["face_match"] is True
+        assert mock_live.call_count == 1
+        assert mock_faces.call_count == 1
+        assert os.path.exists(mock_faces.call_args.args[1])

@@ -187,7 +187,7 @@ def list_deliveries(
     return [_delivery_out(d) for d in rows]
 
 
-@router.delete("/{webhook_id}", status_code=204)
+@router.delete("/{webhook_id}", status_code=204, response_model=None)
 def delete_webhook(
     webhook_id: int,
     db: Session = Depends(get_db),

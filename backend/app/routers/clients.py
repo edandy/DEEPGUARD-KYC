@@ -95,7 +95,7 @@ def client_usage(
     }
 
 
-@router.delete("/{client_id}", status_code=204)
+@router.delete("/{client_id}", status_code=204, response_model=None)
 def deactivate_client(
     client_id: int,
     db: Session = Depends(get_db),

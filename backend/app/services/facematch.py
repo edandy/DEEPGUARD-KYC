@@ -10,7 +10,9 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
-PREFERRED_MODELS = ("VGG-Face", "Facenet", "OpenFace", "ArcFace", "SFace", "GhostFaceNet")
+# SFace primero: en un retrato de DNI con holograma acierta a la misma persona
+# y mantiene lejos a otras caras. VGG-Face, el que cargaba antes, la rechazaba.
+PREFERRED_MODELS = ("SFace", "ArcFace", "Facenet", "VGG-Face", "OpenFace", "GhostFaceNet")
 
 _THRESHOLDS = {
     "VGG-Face": 0.40,
@@ -52,11 +54,9 @@ def is_available() -> bool:
 
 def compare_faces(selfie_path: str, doc_path: str) -> dict:
     """Facial comparison -> `score` 0..1 (1 = same person)."""
-    engine = _engine or "VGG-Face"
-    threshold = _THRESHOLDS.get(engine, 0.40)
     if not is_available():
         return {
-            "engine": engine,
+            "engine": _engine or PREFERRED_MODELS[0],
             "available": False,
             "score": None,
             "distance": None,
@@ -64,6 +64,8 @@ def compare_faces(selfie_path: str, doc_path: str) -> dict:
             "match": None,
             "message": "Face matching engine unavailable — selfie not analyzed.",
         }
+    engine = _engine or PREFERRED_MODELS[0]
+    threshold = _THRESHOLDS.get(engine, 0.40)
     try:
         from deepface import DeepFace
 
