@@ -535,7 +535,7 @@ class TestFaceVerification:
             verified = client.post(
                 "/api/mobile/verify",
                 data={"token": token},
-                files={"selfie": ("selfie.jpg", _tiny_png(), "image/jpeg")},
+                files={"selfie": ("selfie.jpg", _tiny_png() + b"\x00" * 120, "image/jpeg")},
                 headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
             )
 
@@ -545,3 +545,14 @@ class TestFaceVerification:
         assert mock_live.call_count == 1
         assert mock_faces.call_count == 1
         assert os.path.exists(mock_faces.call_args.args[1])
+
+        from app import kyc as kyc_store
+        stored = kyc_store.get_case(case_id)
+        assert stored is not None
+        assert stored.selfie_path and os.path.exists(stored.selfie_path)
+        assert stored.user_agent.startswith("Mozilla/5.0")
+
+        report = client.get(f"/api/reports/{case_id}", headers={"X-API-Key": "dg_demo"})
+        assert report.status_code == 200
+        assert report.content.startswith(b"%PDF")
+        assert report.content.count(b"/Type /Page") >= 6

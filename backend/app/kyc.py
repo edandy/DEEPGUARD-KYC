@@ -14,6 +14,7 @@ import io
 import os
 import random
 import shutil
+import stat
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -209,6 +210,9 @@ class KycCase:
     heatmap: str = ""
     history: list = field(default_factory=list)
     image_path: str = ""
+    selfie_path: str = ""
+    user_agent: str = ""
+    client_ip: str = ""
     document_number: str = ""
     webhook_url: str = ""
     webhook_host: str = ""
@@ -281,13 +285,23 @@ def _allocate_external_id() -> int:
 
 
 def _case_id_path() -> str:
+    return os.path.join(_data_dir(), "kyc_next_id")
+
+
+def _data_dir() -> str:
     for directory in (os.getenv("DEEP_GUARD_DATA_DIR", "/app/data"), SEED_DIR):
         try:
             os.makedirs(directory, exist_ok=True)
-            return os.path.join(directory, "kyc_next_id")
+            return directory
         except OSError:
             continue
-    return os.path.join(SEED_DIR, "kyc_next_id")
+    return SEED_DIR
+
+
+def _case_dir(case_id: int) -> str:
+    path = os.path.join(_data_dir(), "cases", str(case_id))
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def _seed() -> None:
@@ -439,12 +453,15 @@ def create_case(image_path: str, *, applicant: str = "",
     else:
         initial = "pending"
 
-    stored_path = os.path.join(SEED_DIR, "cases", f"{uuid.uuid4().hex}{os.path.splitext(filename or image_path)[1] or '.jpg'}")
-    os.makedirs(os.path.dirname(stored_path), exist_ok=True)
-    shutil.copy2(image_path, stored_path)
-
     applicant = (applicant or "").strip() or "External case"
     cid = _allocate_external_id()
+    extension = os.path.splitext(filename or image_path)[1] or ".jpg"
+    stored_path = os.path.join(_case_dir(cid), f"document{extension}")
+    shutil.copy2(image_path, stored_path)
+    os.chmod(stored_path, stat.S_IRUSR | stat.S_IWUSR)
+
+    signals = dict(res["signals"])
+    signals["document_verdict"] = verdict
     case = KycCase(
         id=cid,
         applicant=applicant.upper(),
@@ -457,7 +474,7 @@ def create_case(image_path: str, *, applicant: str = "",
         score=res["score"],
         verdict=verdict,
         verdict_label=res["verdict_label"],
-        signals=res["signals"],
+        signals=signals,
         reasons=res["reasons"],
         image=res["image"],
         heatmap=res["heatmap"],
@@ -471,12 +488,44 @@ def create_case(image_path: str, *, applicant: str = "",
     return case
 
 
+def remember_capture(
+    case_id: int,
+    *,
+    selfie_path: str = "",
+    user_agent: str = "",
+    client_ip: str = "",
+    liveness_result: dict | None = None,
+    capture_device: str = "",
+) -> KycCase | None:
+    """Copia la selfie al volumen del caso y guarda IP y navegador para el informe."""
+    case = _store.get(case_id)
+    if not case:
+        return None
+
+    if selfie_path and os.path.exists(selfie_path):
+        destination = os.path.join(_case_dir(case.id), "selfie.jpg")
+        shutil.copy2(selfie_path, destination)
+        os.chmod(destination, stat.S_IRUSR | stat.S_IWUSR)
+        case.selfie_path = destination
+
+    case.user_agent = (user_agent or "")[:500]
+    case.client_ip = (client_ip or "")[:80]
+    case.signals["user_agent"] = case.user_agent
+    case.signals["client_ip"] = case.client_ip
+    if capture_device:
+        case.signals["capture_device"] = capture_device
+    if liveness_result is not None:
+        case.signals["liveness"] = liveness_result
+    return case
+
+
 def update_face_verification(
     case_id: int,
     face_match: bool,
     face_score: float,
     liveness_result: dict,
     capture_device: str,
+    face_distance: float | None = None,
 ) -> KycCase | None:
     """Update a KYC case with face verification results from mobile.
 
@@ -489,6 +538,8 @@ def update_face_verification(
     # Store face verification data in signals
     case.signals["face_match"] = face_match
     case.signals["face_score"] = face_score
+    if face_distance is not None:
+        case.signals["face_distance"] = face_distance
     case.signals["liveness"] = liveness_result
     case.signals["capture_device"] = capture_device
 

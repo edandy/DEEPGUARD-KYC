@@ -318,7 +318,9 @@ async def mobile_verify(
         raise HTTPException(status_code=400, detail="Empty selfie.")
 
     # Device check from the request itself (User-Agent), not from form fields.
-    device = check_device(user_agent=request.headers.get("user-agent", "")[:500])
+    user_agent = request.headers.get("user-agent", "")[:500]
+    client_ip = _client_ip(request)
+    device = check_device(user_agent=user_agent)
     if device.is_emulator or device.is_bot:
         raise HTTPException(
             status_code=403,
@@ -345,6 +347,14 @@ async def mobile_verify(
             "checks": live.get("signals", {}),
         }
         if not liveness_result["is_live"]:
+            kyc.remember_capture(
+                case_id,
+                selfie_path=selfie_tmp,
+                user_agent=user_agent,
+                client_ip=client_ip,
+                liveness_result=liveness_result,
+                capture_device=capture_device,
+            )
             _notify_case(case_id, face_match=False, liveness_passed=False)
             raise HTTPException(
                 status_code=403,
@@ -370,6 +380,14 @@ async def mobile_verify(
         except Exception:
             logger.exception("Face match pipeline error")
 
+        kyc.remember_capture(
+            case_id,
+            selfie_path=selfie_tmp,
+            user_agent=user_agent,
+            client_ip=client_ip,
+            liveness_result=liveness_result,
+            capture_device=capture_device,
+        )
         session = complete_session(
             token=token,
             selfie_data=selfie_data,
@@ -399,6 +417,7 @@ async def mobile_verify(
                 face_score=float(face_result.get("score") or 0),
                 liveness_result=liveness_result,
                 capture_device=capture_device,
+                face_distance=face_result.get("distance"),
             )
     except Exception:
         logger.exception("Failed to update KYC case with face verification")
@@ -411,6 +430,15 @@ async def mobile_verify(
     )
 
     return _verify_response(face_result, liveness_result, device)
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:80]
+    if request.client and request.client.host:
+        return request.client.host[:80]
+    return ""
 
 
 def _notify_case(case_id: int, *, face_match: bool | None, liveness_passed: bool, document_verdict: str | None = None) -> None:
